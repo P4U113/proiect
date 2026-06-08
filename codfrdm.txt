@@ -1,0 +1,332 @@
+/*
+ * Copyright (c) 2016, Freescale Semiconductor, Inc.
+ * Copyright 2016-2020,2022-2024 NXP
+ * All rights reserved.
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ */
+
+/*******************************************************************************
+ * Includes
+ ******************************************************************************/
+#include "lwip/opt.h"
+#include "lwip/timeouts.h"
+#include "lwip/init.h"
+#include "lwip/dhcp.h"
+#include "netif/ethernet.h"
+#include "ethernetif.h"
+#include "clock_config.h"
+#include "peripherals.h"
+#include "pin_mux.h"
+
+#include "board.h"
+#include "app.h"
+#include "fsl_phy.h"
+#include "fsl_silicon_id.h"
+
+#include "http_client.h"
+
+#include "fsl_lpadc.h"
+#include "fsl_spc.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+/*******************************************************************************
+ * Definitions
+ ******************************************************************************/
+#ifndef EXAMPLE_NETIF_INIT_FN
+#define EXAMPLE_NETIF_INIT_FN ethernetif0_init
+#endif
+
+#define ADC_CHANNEL_NUMBER   0U
+#define ADC_COMMAND_ID       1U
+#define ADC_TRIGGER_ID       0U
+#define ADC_12BIT_MAX        4095U
+
+#define NTC_NOMINAL_RESISTANCE  10000.0f
+#define NTC_NOMINAL_TEMP        25.0f
+#define NTC_BETA                3950.0f
+#define NTC_SERIES_RESISTOR     10000.0f
+#define KELVIN_OFFSET           273.15f
+
+#define SERVER_IP_1 192
+#define SERVER_IP_2 168
+#define SERVER_IP_3 0
+#define SERVER_IP_4 179
+#define SERVER_PORT 5145
+
+/*******************************************************************************
+ * Prototypes
+ ******************************************************************************/
+static void http_client_demo_result(void *arg, int status_code,
+                                    const char *body, u16_t body_len);
+
+static void ADC_InitCustom(void);
+static uint32_t ADC_ReadRaw(void);
+static float ReadTemperatureC(uint32_t *rawOut);
+static void SendTemperaturePost(void);
+
+
+
+/*******************************************************************************
+ * Variables
+ ******************************************************************************/
+static phy_handle_t phyHandle;
+
+/*******************************************************************************
+ * Code
+ ******************************************************************************/
+static void print_ipv6_addresses(struct netif *netif)
+{
+    for (int i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++)
+    {
+        const char *str_ip = "-";
+        if (ip6_addr_isvalid(netif_ip6_addr_state(netif, i)))
+        {
+            str_ip = ip6addr_ntoa(netif_ip6_addr(netif, i));
+        }
+        PRINTF(" IPv6 Address%d    : %s\r\n", i, str_ip);
+    }
+}
+
+static void netif_ipv6_callback(struct netif *cb_netif)
+{
+    PRINTF("IPv6 address update, valid addresses:\r\n");
+    print_ipv6_addresses(cb_netif);
+    PRINTF("\r\n");
+}
+
+void SysTick_Handler(void)
+{
+    time_isr();
+}
+
+static void http_client_demo_result(void *arg, int status_code,
+                                    const char *body, u16_t body_len)
+{
+    (void)arg;
+
+    PRINTF("\r\n--- HTTP Client POST Result ---\r\n");
+    PRINTF(" Status code: %d\r\n", status_code);
+
+    if (body != NULL && body_len > 0)
+    {
+        PRINTF(" Body (%u bytes): %.*s\r\n",
+               (unsigned int)body_len,
+               (int)body_len,
+               body);
+    }
+
+    PRINTF("-------------------------------\r\n");
+}
+
+static void ADC_InitCustom(void)
+{
+    lpadc_config_t adcConfig;
+    lpadc_conv_command_config_t cmdConfig;
+    lpadc_conv_trigger_config_t trigConfig;
+
+    SPC_EnableActiveModeAnalogModules(SPC0, kSPC_controlVref);
+
+    CLOCK_AttachClk(kFRO_HF_to_ADC0);
+    CLOCK_SetClkDiv(kCLOCK_DivAdc0Clk, 1U);
+    CLOCK_EnableClock(kCLOCK_Adc0);
+
+    LPADC_GetDefaultConfig(&adcConfig);
+    adcConfig.referenceVoltageSource = kLPADC_ReferenceVoltageAlt1;
+
+    LPADC_Init(ADC0, &adcConfig);
+    LPADC_DoAutoCalibration(ADC0);
+
+    LPADC_GetDefaultConvCommandConfig(&cmdConfig);
+    cmdConfig.channelNumber = ADC_CHANNEL_NUMBER;
+    cmdConfig.sampleChannelMode = kLPADC_SampleChannelSingleEndSideA;
+    cmdConfig.conversionResolutionMode = kLPADC_ConversionResolutionStandard;
+    LPADC_SetConvCommandConfig(ADC0, ADC_COMMAND_ID, &cmdConfig);
+
+    LPADC_GetDefaultConvTriggerConfig(&trigConfig);
+    trigConfig.targetCommandId = ADC_COMMAND_ID;
+    trigConfig.enableHardwareTrigger = false;
+    LPADC_SetConvTriggerConfig(ADC0, ADC_TRIGGER_ID, &trigConfig);
+}
+
+static uint32_t ADC_ReadRaw(void)
+{
+    lpadc_conv_result_t result;
+
+    LPADC_DoSoftwareTrigger(ADC0, 1U);
+
+    while (!LPADC_GetConvResult(ADC0, &result, 0U))
+    {
+    }
+
+    return result.convValue >> 1U;
+}
+
+static float ReadTemperatureC(uint32_t *rawOut)
+{
+    uint32_t rawValue = ADC_ReadRaw();
+
+    if (rawOut != NULL)
+    {
+        *rawOut = rawValue;
+    }
+
+    if (rawValue == 0U || rawValue >= ADC_12BIT_MAX)
+    {
+        return 0.0f;
+    }
+
+    float resistance = NTC_SERIES_RESISTOR * (float)rawValue /
+                       (float)(ADC_12BIT_MAX - rawValue);
+
+    float steinhart = logf(resistance / NTC_NOMINAL_RESISTANCE) / NTC_BETA;
+    steinhart += 1.0f / (NTC_NOMINAL_TEMP + KELVIN_OFFSET);
+
+    return ((1.0f / steinhart) - KELVIN_OFFSET)-4.0f;
+}
+
+static void SendTemperaturePost(void)
+{
+    ip_addr_t demo_server_ip;
+    static char demo_body[160];
+
+    uint32_t rawValue = 0U;
+    float tempC = ReadTemperatureC(&rawValue);
+
+    int tempTimes100 = (int)(tempC * 100.0f);
+    int tempInt = tempTimes100 / 100;
+    int tempFrac = tempTimes100 % 100;
+
+    if (tempFrac < 0)
+    {
+        tempFrac = -tempFrac;
+    }
+
+    PRINTF("ADC raw = %u\r\n", rawValue);
+    PRINTF("Temperature = %d.%02d C\r\n", tempInt, tempFrac);
+
+    snprintf(demo_body,
+             sizeof(demo_body),
+             "{\"deviceId\":\"FRDM001\","
+             "\"name\":\"Pneaga\","
+             "\"temperature\":%d.%02d}",
+             tempInt,
+             tempFrac);
+
+    PRINTF("JSON = %s\r\n", demo_body);
+
+    IP_ADDR4(&demo_server_ip, SERVER_IP_1, SERVER_IP_2, SERVER_IP_3, SERVER_IP_4);
+
+    err_t err = http_client_post(
+        &demo_server_ip,
+        SERVER_PORT,
+        "/api/api/data",
+        "application/json",
+        demo_body,
+        (u16_t)strlen(demo_body),
+        http_client_demo_result,
+        NULL);
+
+    if (err != ERR_OK)
+    {
+        PRINTF("HTTP Client POST failed to start: %d\r\n", (int)err);
+    }
+    else
+    {
+        PRINTF("HTTP Client POST request initiated to %s:%d\r\n",
+               ipaddr_ntoa(&demo_server_ip),
+               SERVER_PORT);
+    }
+}
+
+int main(void)
+{
+    struct netif netif;
+    ip4_addr_t netif_ipaddr, netif_netmask, netif_gw;
+
+    ethernetif_config_t enet_config = {
+        .phyHandle   = &phyHandle,
+        .phyAddr     = EXAMPLE_PHY_ADDRESS,
+        .phyOps      = EXAMPLE_PHY_OPS,
+        .phyResource = EXAMPLE_PHY_RESOURCE,
+    };
+
+    BOARD_InitHardware();
+
+
+    time_init();
+
+    (void)SILICONID_ConvertToMacAddr(&enet_config.macAddress);
+    enet_config.srcClockHz = EXAMPLE_CLOCK_FREQ;
+
+    IP4_ADDR(&netif_ipaddr, 0, 0, 0, 0);
+    IP4_ADDR(&netif_netmask, 0, 0, 0, 0);
+    IP4_ADDR(&netif_gw, 0, 0, 0, 0);
+
+    lwip_init();
+    ADC_InitCustom();
+    PRINTF("ADC init OK\r\n");
+
+
+    netif_add(&netif,
+              &netif_ipaddr,
+              &netif_netmask,
+              &netif_gw,
+              &enet_config,
+              EXAMPLE_NETIF_INIT_FN,
+              ethernet_input);
+
+    netif_set_default(&netif);
+    netif_set_up(&netif);
+
+    netif_create_ip6_linklocal_address(&netif, 1);
+
+    while (ethernetif_wait_linkup(&netif, 5000) != ERR_OK)
+    {
+        PRINTF("PHY Auto-negotiation failed. Please check cable.\r\n");
+    }
+
+    dhcp_start(&netif);
+
+    PRINTF("\r\nWaiting for DHCP address...\r\n");
+
+    while (dhcp_supplied_address(&netif) == 0)
+    {
+        ethernetif_input(&netif);
+        sys_check_timeouts();
+    }
+
+    set_ipv6_valid_state_cb(netif_ipv6_callback);
+
+    PRINTF("\r\n***********************************************************\r\n");
+    PRINTF(" HTTP Client Temperature Sender\r\n");
+    PRINTF("***********************************************************\r\n");
+    PRINTF(" IPv4 Address     : %s\r\n", ip4addr_ntoa(netif_ip4_addr(&netif)));
+    PRINTF(" IPv4 Subnet mask : %s\r\n", ip4addr_ntoa(netif_ip4_netmask(&netif)));
+    PRINTF(" IPv4 Gateway     : %s\r\n", ip4addr_ntoa(netif_ip4_gw(&netif)));
+    PRINTF(" Server           : %d.%d.%d.%d:%d\r\n",
+           SERVER_IP_1,
+           SERVER_IP_2,
+           SERVER_IP_3,
+           SERVER_IP_4,
+           SERVER_PORT);
+    PRINTF("***********************************************************\r\n");
+
+    uint32_t counter = 0;
+
+    while (1)
+    {
+        ethernetif_input(&netif);
+        sys_check_timeouts();
+        counter++;
+
+            if (counter >= 5000000)
+            {
+                counter = 0;
+                SendTemperaturePost();
+            }
+    }
+}
